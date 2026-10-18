@@ -5,6 +5,7 @@
 #include <atomic>
 #include <vector>
 #include <string>
+#include <algorithm>
 
 using namespace finenet;
 
@@ -15,6 +16,7 @@ TEST(KeyedQueueTest, EmptyOnConstruction) {
     EXPECT_FALSE(q.isShutdown());
     EXPECT_FALSE(q.hasAlarm());
     EXPECT_FALSE(q.isAttached());
+    EXPECT_FALSE(q.hasPriorityExtractor());
 }
 
 TEST(KeyedQueueTest, PushAndTryPop) {
@@ -136,6 +138,100 @@ TEST(KeyedQueueTest, Contains) {
     EXPECT_FALSE(q.contains(1));
 }
 
+// --- Priority ordering tests ---
+
+namespace {
+struct RebuildReq {
+    int priority = 100;
+    int version = 1;
+};
+}  // namespace
+
+TEST(KeyedQueueTest, PriorityOrderingAndTieBreaking) {
+    KeyedQueue<std::string, RebuildReq> q(
+        [](const RebuildReq& existing, const RebuildReq& incoming) {
+            return RebuildReq{
+                std::min(existing.priority, incoming.priority),
+                incoming.version
+            };
+        },
+        [](const RebuildReq& r) { return r.priority; }
+    );
+
+    EXPECT_TRUE(q.hasPriorityExtractor());
+
+    // Push in mixed priority order:
+    // background (1000), normal (100), immediate (0), normal (100), immediate (0)
+    q.push("chunk_bg", RebuildReq{1000, 1});
+    q.push("chunk_norm1", RebuildReq{100, 1});
+    q.push("chunk_imm1", RebuildReq{0, 1});
+    q.push("chunk_norm2", RebuildReq{100, 1});
+    q.push("chunk_imm2", RebuildReq{0, 1});
+
+    // Should pop immediate (0) in insertion order, then normal (100) in insertion order, then bg (1000)
+    EXPECT_EQ(q.tryPop()->first, "chunk_imm1");
+    EXPECT_EQ(q.tryPop()->first, "chunk_imm2");
+    EXPECT_EQ(q.tryPop()->first, "chunk_norm1");
+    EXPECT_EQ(q.tryPop()->first, "chunk_norm2");
+    EXPECT_EQ(q.tryPop()->first, "chunk_bg");
+    EXPECT_TRUE(q.empty());
+}
+
+TEST(KeyedQueueTest, PriorityUpgradeViaMergeRespected) {
+    KeyedQueue<std::string, RebuildReq> q(
+        [](const RebuildReq& existing, const RebuildReq& incoming) {
+            return RebuildReq{
+                std::min(existing.priority, incoming.priority),
+                incoming.version
+            };
+        },
+        [](const RebuildReq& r) { return r.priority; }
+    );
+
+    // Initially queued as background (1000), then normal (100)
+    q.push("chunk_A", RebuildReq{1000, 1});
+    q.push("chunk_B", RebuildReq{100, 1});
+
+    // Now player breaks a block in chunk_A -> upgraded to immediate (0)!
+    EXPECT_FALSE(q.push("chunk_A", RebuildReq{0, 2}));
+    EXPECT_EQ(q.size(), 2u);
+
+    // chunk_A must now pop BEFORE chunk_B with its merged version = 2!
+    auto first = q.tryPop();
+    ASSERT_TRUE(first.has_value());
+    EXPECT_EQ(first->first, "chunk_A");
+    EXPECT_EQ(first->second.priority, 0);
+    EXPECT_EQ(first->second.version, 2);
+
+    auto second = q.tryPop();
+    ASSERT_TRUE(second.has_value());
+    EXPECT_EQ(second->first, "chunk_B");
+}
+
+TEST(KeyedQueueTest, DrainAllAndDrainUpToRespectPriorityOrder) {
+    KeyedQueue<int, RebuildReq> q(
+        [](const RebuildReq& a, const RebuildReq& b) {
+            return RebuildReq{std::min(a.priority, b.priority), b.version};
+        },
+        [](const RebuildReq& r) { return r.priority; }
+    );
+
+    q.push(1, RebuildReq{1000, 1});
+    q.push(2, RebuildReq{100, 1});
+    q.push(3, RebuildReq{0, 1});
+    q.push(4, RebuildReq{100, 1});
+
+    auto top2 = q.drainUpTo(2);
+    ASSERT_EQ(top2.size(), 2u);
+    EXPECT_EQ(top2[0].first, 3); // priority 0
+    EXPECT_EQ(top2[1].first, 2); // priority 100 (earlier than 4)
+
+    auto rest = q.drainAll();
+    ASSERT_EQ(rest.size(), 2u);
+    EXPECT_EQ(rest[0].first, 4); // priority 100
+    EXPECT_EQ(rest[1].first, 1); // priority 1000
+}
+
 // --- Batch operations ---
 
 TEST(KeyedQueueTest, PushBatch) {
@@ -227,7 +323,7 @@ TEST(KeyedQueueTest, AlarmSetAndClear) {
     q.setAlarm(std::chrono::steady_clock::now() + std::chrono::hours(1));
     EXPECT_TRUE(q.hasAlarm());
 
-    q.clearAlarm();
+    q.resetAlarm();
     EXPECT_FALSE(q.hasAlarm());
 }
 
@@ -244,6 +340,22 @@ TEST(KeyedQueueTest, AlarmWakesWaitForWork) {
 
     waiter.join();
     EXPECT_TRUE(woke);
+}
+
+TEST(KeyedQueueTest, EarlierAlarmUpdatesDeadlineAndWakesWaiter) {
+    KeyedQueue<int, std::string> q;
+    auto now = std::chrono::steady_clock::now();
+
+    q.setAlarm(now + std::chrono::milliseconds(500));
+    q.setAlarm(now + std::chrono::milliseconds(35));
+    q.setAlarm(now + std::chrono::milliseconds(400)); // Later — must be ignored
+
+    auto start = std::chrono::steady_clock::now();
+    q.waitForWork();
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start);
+
+    EXPECT_LT(elapsed.count(), 200);
 }
 
 // --- Shutdown tests ---

@@ -12,6 +12,8 @@ TEST(QueueTest, EmptyOnConstruction) {
     Queue<int> q;
     EXPECT_TRUE(q.empty());
     EXPECT_EQ(q.size(), 0u);
+    EXPECT_EQ(q.capacity(), 0u);
+    EXPECT_FALSE(q.isFull());
     EXPECT_FALSE(q.isShutdown());
     EXPECT_FALSE(q.hasAlarm());
     EXPECT_FALSE(q.isAttached());
@@ -20,7 +22,7 @@ TEST(QueueTest, EmptyOnConstruction) {
 TEST(QueueTest, PushAndTryPop) {
     Queue<int> q;
 
-    q.push(42);
+    EXPECT_TRUE(q.push(42));
     EXPECT_FALSE(q.empty());
     EXPECT_EQ(q.size(), 1u);
 
@@ -40,9 +42,9 @@ TEST(QueueTest, TryPopEmptyReturnsNullopt) {
 
 TEST(QueueTest, FIFOOrder) {
     Queue<int> q;
-    q.push(1);
-    q.push(2);
-    q.push(3);
+    EXPECT_TRUE(q.push(1));
+    EXPECT_TRUE(q.push(2));
+    EXPECT_TRUE(q.push(3));
 
     EXPECT_EQ(*q.tryPop(), 1);
     EXPECT_EQ(*q.tryPop(), 2);
@@ -53,7 +55,7 @@ TEST(QueueTest, FIFOOrder) {
 TEST(QueueTest, MoveSemantics) {
     Queue<std::string> q;
     std::string s = "hello";
-    q.push(std::move(s));
+    EXPECT_TRUE(q.push(std::move(s)));
 
     auto val = q.tryPop();
     ASSERT_TRUE(val.has_value());
@@ -63,7 +65,7 @@ TEST(QueueTest, MoveSemantics) {
 TEST(QueueTest, PushBatchVector) {
     Queue<int> q;
     std::vector<int> items = {10, 20, 30, 40};
-    q.pushBatch(std::move(items));
+    EXPECT_TRUE(q.pushBatch(std::move(items)));
 
     EXPECT_EQ(q.size(), 4u);
     EXPECT_EQ(*q.tryPop(), 10);
@@ -75,7 +77,7 @@ TEST(QueueTest, PushBatchVector) {
 TEST(QueueTest, PushBatchIterators) {
     Queue<int> q;
     std::vector<int> items = {5, 6, 7};
-    q.pushBatch(items.begin(), items.end());
+    EXPECT_TRUE(q.pushBatch(items.begin(), items.end()));
 
     EXPECT_EQ(q.size(), 3u);
     EXPECT_EQ(*q.tryPop(), 5);
@@ -136,6 +138,113 @@ TEST(QueueTest, Clear) {
     EXPECT_FALSE(q.hasAlarm());
 }
 
+// --- Capacity & Backpressure tests ---
+
+TEST(QueueTest, BoundedCapacityNonBlockingBackpressure) {
+    Queue<int> q(3);
+    EXPECT_EQ(q.capacity(), 3u);
+    EXPECT_FALSE(q.isFull());
+
+    EXPECT_TRUE(q.push(10));
+    EXPECT_TRUE(q.push(20));
+    EXPECT_FALSE(q.isFull());
+    EXPECT_TRUE(q.push(30));
+    EXPECT_TRUE(q.isFull());
+    EXPECT_EQ(q.size(), 3u);
+
+    // Next push must fail without enqueuing
+    EXPECT_FALSE(q.push(40));
+    int mv = 50;
+    EXPECT_FALSE(q.push(std::move(mv)));
+    EXPECT_EQ(q.size(), 3u);
+
+    // Popping frees one slot
+    EXPECT_EQ(*q.tryPop(), 10);
+    EXPECT_FALSE(q.isFull());
+    EXPECT_TRUE(q.push(40));
+    EXPECT_TRUE(q.isFull());
+
+    EXPECT_EQ(*q.tryPop(), 20);
+    EXPECT_EQ(*q.tryPop(), 30);
+    EXPECT_EQ(*q.tryPop(), 40);
+    EXPECT_TRUE(q.empty());
+}
+
+TEST(QueueTest, PushBatchRespectsCapacity) {
+    Queue<int> q(3);
+    EXPECT_TRUE(q.pushBatch(std::vector<int>{1, 2}));
+    EXPECT_EQ(q.size(), 2u);
+
+    // Batch of 2 would exceed capacity 3 -> rejected without enqueuing
+    EXPECT_FALSE(q.pushBatch(std::vector<int>{3, 4}));
+    EXPECT_EQ(q.size(), 2u);
+
+    // Batch of 1 fits
+    EXPECT_TRUE(q.pushBatch(std::vector<int>{3}));
+    EXPECT_TRUE(q.isFull());
+
+    // Any further batch when full is rejected
+    EXPECT_FALSE(q.pushBatch(std::vector<int>{4}));
+}
+
+TEST(QueueTest, PushBlockingWaitsForConsumerPop) {
+    Queue<int> q(2);
+    EXPECT_TRUE(q.push(1));
+    EXPECT_TRUE(q.push(2));
+    EXPECT_TRUE(q.isFull());
+
+    std::atomic<bool> thirdPushed{false};
+    std::thread producer([&]() {
+        bool ok = q.pushBlocking(3);
+        EXPECT_TRUE(ok);
+        thirdPushed = true;
+    });
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    EXPECT_FALSE(thirdPushed.load());
+
+    // Pop one item to unblock producer
+    EXPECT_EQ(*q.tryPop(), 1);
+    producer.join();
+    EXPECT_TRUE(thirdPushed.load());
+    EXPECT_EQ(*q.tryPop(), 2);
+    EXPECT_EQ(*q.tryPop(), 3);
+}
+
+TEST(QueueTest, PushBlockingUnblocksOnShutdown) {
+    Queue<int> q(1);
+    EXPECT_TRUE(q.push(1));
+
+    std::atomic<bool> pushResult{true};
+    std::thread producer([&]() {
+        pushResult = q.pushBlocking(2);
+    });
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    q.shutdown();
+    producer.join();
+
+    EXPECT_FALSE(pushResult.load());
+}
+
+TEST(QueueTest, PushBlockingUnblocksOnSetCapacity) {
+    Queue<int> q(1);
+    EXPECT_TRUE(q.push(1));
+
+    std::atomic<bool> pushResult{false};
+    std::thread producer([&]() {
+        pushResult = q.pushBlocking(2);
+    });
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    EXPECT_FALSE(pushResult.load());
+
+    q.setCapacity(2);
+    producer.join();
+    EXPECT_TRUE(pushResult.load());
+    EXPECT_EQ(q.size(), 2u);
+}
+
 // --- Alarm tests ---
 
 TEST(QueueTest, AlarmSetAndClear) {
@@ -145,7 +254,7 @@ TEST(QueueTest, AlarmSetAndClear) {
     q.setAlarm(std::chrono::steady_clock::now() + std::chrono::hours(1));
     EXPECT_TRUE(q.hasAlarm());
 
-    q.clearAlarm();
+    q.resetAlarm();
     EXPECT_FALSE(q.hasAlarm());
 }
 
@@ -164,22 +273,48 @@ TEST(QueueTest, AlarmWakesWaitForWork) {
     EXPECT_TRUE(woke);
 }
 
-TEST(QueueTest, AlarmKeepsLaterTime) {
+TEST(QueueTest, EarlierAlarmUpdatesDeadlineAndLaterAlarmDoesNotOverwrite) {
     Queue<int> q;
     auto now = std::chrono::steady_clock::now();
 
-    q.setAlarm(now + std::chrono::milliseconds(200));
-    q.setAlarm(now + std::chrono::milliseconds(100)); // Earlier — should be ignored
+    // Schedule a far-future alarm (500ms), then an earlier alarm (40ms), then a later one (400ms)
+    q.setAlarm(now + std::chrono::milliseconds(500));
+    q.setAlarm(now + std::chrono::milliseconds(40));
+    q.setAlarm(now + std::chrono::milliseconds(400)); // Later — must NOT overwrite 40ms
 
-    // The alarm should still be at 200ms (keeps the LATER time)
     EXPECT_TRUE(q.hasAlarm());
 
-    // Verify by waiting — should take at least ~200ms, not ~100ms
     auto start = std::chrono::steady_clock::now();
     q.waitForWork();
     auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - start);
-    EXPECT_GE(elapsed.count(), 150); // Should be close to 200ms
+
+    // Should wake near 40ms, well below 200ms
+    EXPECT_LT(elapsed.count(), 200);
+}
+
+TEST(QueueTest, EarlierAlarmWakesAlreadyWaitingThreadEarly) {
+    Queue<int> q;
+    auto start = std::chrono::steady_clock::now();
+    q.setAlarm(start + std::chrono::seconds(5));
+
+    std::atomic<bool> woke{false};
+    std::thread waiter([&]() {
+        q.waitForWork();
+        woke = true;
+    });
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    EXPECT_FALSE(woke.load());
+
+    // Now set an earlier alarm 25ms from now; waiter should wake up promptly
+    q.setAlarm(std::chrono::steady_clock::now() + std::chrono::milliseconds(25));
+    waiter.join();
+
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start);
+    EXPECT_TRUE(woke.load());
+    EXPECT_LT(elapsed.count(), 500);
 }
 
 // --- Shutdown tests ---
@@ -205,7 +340,7 @@ TEST(QueueTest, PushAfterShutdownDrops) {
     Queue<int> q;
     q.shutdown();
 
-    q.push(42);
+    EXPECT_FALSE(q.push(42));
     EXPECT_TRUE(q.empty());
 }
 
@@ -231,7 +366,7 @@ TEST(QueueTest, ResetShutdown) {
     EXPECT_FALSE(q.isShutdown());
 
     // Should accept pushes again
-    q.push(42);
+    EXPECT_TRUE(q.push(42));
     EXPECT_EQ(*q.tryPop(), 42);
 }
 
