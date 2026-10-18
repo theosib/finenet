@@ -1,0 +1,20 @@
+# Build directories
+build/
+cmake-build-*/
+
+# Compiled objects and libraries
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+
+# OS / Editor artifacts
+.DS_Store
+*.swp
+*~
+.vscode/
+.idea/
+compile_commands.json
