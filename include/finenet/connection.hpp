@@ -22,6 +22,9 @@
 
 namespace finenet {
 
+class WakeSignal;
+class Listener;
+
 /**
  * @brief Connection lifecycle states
  */
@@ -82,6 +85,9 @@ struct ConnectionConfig {
     uint32_t compressionThreads = 2;
     uint32_t maxRetransmissions = 15;
     float coalescingWindowMs = 0.0f;
+
+    /// Largest message accepted from the network, so a peer can't make us buffer without limit
+    size_t maxMessageBytes = 64 * 1024 * 1024;
 
     /// Force local connections to encode/decode messages through wire bytes
     bool debugSerialization = false;
@@ -180,6 +186,16 @@ public:
     static std::pair<std::unique_ptr<Connection>, std::unique_ptr<Connection>>
     createLocalPair(const ConnectionConfig& config = {});
 
+    /**
+     * @brief Connect to a Listener over TCP
+     *
+     * Returns at once, in the Connecting state. Watch state(), or onStateChange: network state
+     * changes arrive on the connection's own I/O thread. A connection that fails ends up
+     * Disconnected, with the cause in disconnectReason().
+     */
+    static std::unique_ptr<Connection> connect(const std::string& host, uint16_t port,
+                                               const ConnectionConfig& config = {});
+
     ~Connection();
 
     Connection(const Connection&) = delete;
@@ -197,8 +213,16 @@ public:
         return transportType() == TransportType::Local;
     }
 
+    /// Who's at the other end, as a numeric address. Empty for a local connection.
+    [[nodiscard]] std::string peerAddress() const;
+
     [[nodiscard]] const ConnectionConfig& config() const noexcept;
     [[nodiscard]] std::optional<ChannelConfig> channelConfig(ChannelId channel) const;
+
+    /// Bytes accepted by send() that the peer hasn't got yet, as far as is known here. Latest-state
+    /// senders check this first: better to send fresh data late than stale data on time.
+    [[nodiscard]] size_t pendingBytes() const;
+    [[nodiscard]] size_t pendingBytes(ChannelId channel) const;
 
     // ── Sending ──
     SendResult send(ChannelId channel, Message msg);
@@ -218,6 +242,9 @@ public:
     Queue<Message>& inboundQueue();
     Queue<Message>& inboundQueue(ChannelId channel);
 
+    /// Signal this whenever a message arrives, for a thread serving several connections
+    void setWakeSignal(WakeSignal* signal);
+
     // ── Lifecycle ──
     void update();
     void disconnect(std::string_view reason = "");
@@ -226,8 +253,13 @@ public:
     [[nodiscard]] ConnectionStats stats() const;
 
 private:
+    friend class Listener;
     struct Impl;
     explicit Connection(std::shared_ptr<Impl> impl);
+
+    /// Wrap an accepted socket. It reads Connecting until the peer's preamble arrives.
+    static std::unique_ptr<Connection> fromAccepted(int fd, std::string peerAddress,
+                                                    const ConnectionConfig& config);
 
     SendResult sendInternal(ChannelId channel, Message msg, std::optional<Priority> overridePriority);
 

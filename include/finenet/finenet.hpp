@@ -15,3 +15,6 @@
 #include "finenet/message_reader.hpp"
 #include "finenet/connection.hpp"
 #include "finenet/queue_bridge.hpp"
+#include "finenet/endpoint.hpp"
+#include "finenet/listener.hpp"
+#include "finenet/discovery.hpp"

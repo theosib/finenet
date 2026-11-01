@@ -18,6 +18,10 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 add_library(finenet
     src/message.cpp
     src/connection.cpp
+    src/endpoint.cpp
+    src/stream_transport.cpp
+    src/listener.cpp
+    src/discovery.cpp
 )
 add_library(finenet::finenet ALIAS finenet)
 
@@ -27,6 +31,9 @@ target_include_directories(finenet PUBLIC
 )
 
 target_compile_features(finenet PUBLIC cxx_std_20)
+
+find_package(Threads REQUIRED)
+target_link_libraries(finenet PUBLIC Threads::Threads)
 
 # ── Tests ────────────────────────────────────────────────────────────────────
 
@@ -50,6 +57,9 @@ if(FINENET_BUILD_TESTS)
         tests/test_message.cpp
         tests/test_connection.cpp
         tests/test_queue_bridge.cpp
+        tests/test_endpoint.cpp
+        tests/test_stream_transport.cpp
+        tests/test_discovery.cpp
     )
 
     target_link_libraries(finenet_tests PRIVATE finenet GTest::gtest GTest::gtest_main)
