@@ -325,6 +325,22 @@ int addressRank(const std::string& text) {
 
 }  // namespace
 
+std::vector<std::string> localAddresses() {
+    std::vector<std::string> out;
+    for (const Interface& iface : ipv4Interfaces()) {
+        char text[INET_ADDRSTRLEN] = {0};
+        if (inet_ntop(AF_INET, &iface.address, text, sizeof(text))) {
+            // Point-to-point is a VPN, which is the last thing to offer a neighbour
+            if (iface.pointToPoint) {
+                out.emplace_back(text);
+            } else {
+                out.emplace(out.begin(), text);
+            }
+        }
+    }
+    return out;
+}
+
 // ============================================================================
 // DiscoveryBeacon
 // ============================================================================

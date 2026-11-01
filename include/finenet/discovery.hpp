@@ -30,6 +30,9 @@ namespace finenet {
 
 inline constexpr uint16_t DISCOVERY_PORT = 7811;
 
+/// This machine's IPv4 addresses, leaving out loopback: what to read out to someone joining by hand
+[[nodiscard]] std::vector<std::string> localAddresses();
+
 /**
  * @brief Makes a server findable. Runs its own thread.
  */

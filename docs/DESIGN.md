@@ -1,5 +1,10 @@
 # finenet — General-Purpose Network Transport Layer
 
+> **Built so far:** the local transport, TCP (`stream_transport.cpp`), `Listener`, and LAN discovery
+> (`discovery.hpp`). UDP, compression inside the library, and congestion control below are still
+> design. The framing that's on the wire is specified in FineStructureVoxel's
+> `docs/protocol/PROTOCOL.md` §2, and this document's §6.2 is out of date.
+
 A standalone, reusable C++ library for structured message passing over UDP
 (with TCP fallback) or in-process shared memory. Designed for applications
 that need multiple logical channels with independent reliability, ordering,
