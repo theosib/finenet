@@ -24,14 +24,9 @@ These passed nothing because nothing has tried them.
   sets `sweep = false`, and on a working network the browser finds something before it starts.
 - **`blocked()`.** macOS denying Local Network access has never happened here, so the `EHOSTUNREACH`
   path is untested. The test only checks that it stays false.
-- **Windows.** Only macOS and Linux have built this.
 
 ## Problems
 
-- **POSIX only.** `src/stream_transport.cpp`, `src/listener.cpp`, `src/discovery.cpp` and two test
-  files won't build on Windows. It needs Winsock start-up, `closesocket`, `WSAPoll`, `ioctlsocket` in
-  place of `fcntl`, something other than `pipe()` to wake the I/O thread (a loopback socket pair),
-  and `GetAdaptersAddresses` in place of `getifaddrs`.
 - **`SO_REUSEPORT` on Linux hasn't shown up, but could.** Several processes share the discovery port,
   and a unicast datagram to a shared port goes to just one socket, chosen by hash, which may be a
   browser's and not a beacon's. That could lose direct probes, and loopback queries with two servers
