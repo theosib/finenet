@@ -1,10 +1,10 @@
 #include "finenet/discovery.hpp"
 
+#include "socket_compat.hpp"
 #include "stream_transport.hpp"
 
 #include <algorithm>
 #include <atomic>
-#include <cerrno>
 #include <condition_variable>
 #include <cstring>
 #include <map>
@@ -13,15 +13,13 @@
 #include <random>
 #include <thread>
 
-#include <arpa/inet.h>
-#include <fcntl.h>
+#ifdef _WIN32
+#include <iphlpapi.h>
+#include <netioapi.h>
+#else
 #include <ifaddrs.h>
 #include <net/if.h>
-#include <netdb.h>
-#include <netinet/in.h>
-#include <poll.h>
-#include <sys/socket.h>
-#include <unistd.h>
+#endif
 
 namespace finenet {
 
@@ -58,6 +56,65 @@ struct Interface {
     bool canMulticast = false;
     bool pointToPoint = false;
 };
+
+#ifdef _WIN32
+
+/// Each adapter that's up, not loopback, with its addresses of `family`
+template <typename Visit>
+void forEachAdapter(ULONG family, Visit visit) {
+    ULONG size = 16 * 1024;
+    std::vector<uint8_t> buffer;
+    ULONG result = ERROR_BUFFER_OVERFLOW;
+    for (int tries = 0; tries < 3 && result == ERROR_BUFFER_OVERFLOW; ++tries) {
+        buffer.resize(size);
+        result = GetAdaptersAddresses(family, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_DNS_SERVER, nullptr,
+                                      reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buffer.data()), &size);
+    }
+    if (result != NO_ERROR) return;
+    for (auto* adapter = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buffer.data()); adapter; adapter = adapter->Next) {
+        if (adapter->OperStatus != IfOperStatusUp) continue;
+        if (adapter->IfType == IF_TYPE_SOFTWARE_LOOPBACK) continue;
+        visit(*adapter);
+    }
+}
+
+std::vector<Interface> ipv4Interfaces() {
+    std::vector<Interface> out;
+    forEachAdapter(AF_INET, [&](const IP_ADAPTER_ADDRESSES& adapter) {
+        for (auto* unicast = adapter.FirstUnicastAddress; unicast; unicast = unicast->Next) {
+            const sockaddr* addr = unicast->Address.lpSockaddr;
+            if (!addr || addr->sa_family != AF_INET) continue;
+            Interface iface;
+            iface.name = adapter.AdapterName ? adapter.AdapterName : "";
+            iface.index = adapter.IfIndex;
+            iface.address = reinterpret_cast<const sockaddr_in*>(addr)->sin_addr;
+            ULONG mask = 0;
+            ConvertLengthToIpv4Mask(unicast->OnLinkPrefixLength, &mask);
+            iface.netmask.s_addr = mask;
+            iface.canMulticast = (adapter.Flags & IP_ADAPTER_NO_MULTICAST) == 0;
+            iface.pointToPoint = adapter.IfType == IF_TYPE_PPP || adapter.IfType == IF_TYPE_TUNNEL;
+            if (!iface.pointToPoint && unicast->OnLinkPrefixLength < 31) {
+                iface.canBroadcast = true;
+                iface.broadcast.s_addr = iface.address.s_addr | ~mask;
+            }
+            out.push_back(iface);
+        }
+    });
+    return out;
+}
+
+std::vector<unsigned> ipv6Interfaces() {
+    std::vector<unsigned> out;
+    forEachAdapter(AF_INET6, [&](const IP_ADAPTER_ADDRESSES& adapter) {
+        if (adapter.Flags & IP_ADAPTER_NO_MULTICAST) return;
+        if (!(adapter.Flags & IP_ADAPTER_IPV6_ENABLED) || adapter.Ipv6IfIndex == 0) return;
+        unsigned index = adapter.Ipv6IfIndex;
+        if (std::find(out.begin(), out.end(), index) == out.end()) out.push_back(index);
+    });
+    return out;
+}
+
+#else
 
 std::vector<Interface> ipv4Interfaces() {
     std::vector<Interface> out;
@@ -100,48 +157,59 @@ std::vector<unsigned> ipv6Interfaces() {
     return out;
 }
 
+#endif
+
 void setCommonOptions(int fd) {
     detail::prepareSocket(fd);
-    int flags = fcntl(fd, F_GETFL, 0);
-    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    sock::setNonBlocking(fd);
+    sock::disableConnReset(fd);
     int on = 1;
-    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+    // On Windows this alone lets everyone on the machine who wants the discovery port share it
+    sock::setOption(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
 #ifdef SO_REUSEPORT
     // Everyone on the machine who wants the discovery port gets to share it
-    setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &on, sizeof(on));
+    sock::setOption(fd, SOL_SOCKET, SO_REUSEPORT, &on, sizeof(on));
+#endif
+}
+
+int bindTo(int fd, const void* addr, size_t size) {
+#ifdef _WIN32
+    return ::bind(static_cast<SOCKET>(fd), static_cast<const sockaddr*>(addr), static_cast<int>(size));
+#else
+    return ::bind(fd, static_cast<const sockaddr*>(addr), static_cast<socklen_t>(size));
 #endif
 }
 
 /// A socket on the discovery port, for hearing what's sent to the group or broadcast
 int openBoundV4(uint16_t port) {
-    int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
+    int fd = sock::open(AF_INET, SOCK_DGRAM, 0);
     if (fd < 0) return -1;
     setCommonOptions(fd);
     int on = 1;
-    setsockopt(fd, SOL_SOCKET, SO_BROADCAST, &on, sizeof(on));
+    sock::setOption(fd, SOL_SOCKET, SO_BROADCAST, &on, sizeof(on));
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
     addr.sin_port = htons(port);
-    if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
-        ::close(fd);
+    if (bindTo(fd, &addr, sizeof(addr)) != 0) {
+        sock::close(fd);
         return -1;
     }
     return fd;
 }
 
 int openBoundV6(uint16_t port) {
-    int fd = ::socket(AF_INET6, SOCK_DGRAM, 0);
+    int fd = sock::open(AF_INET6, SOCK_DGRAM, 0);
     if (fd < 0) return -1;
     setCommonOptions(fd);
     int on = 1;
-    setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &on, sizeof(on));
+    sock::setOption(fd, IPPROTO_IPV6, IPV6_V6ONLY, &on, sizeof(on));
     sockaddr_in6 addr{};
     addr.sin6_family = AF_INET6;
     addr.sin6_addr = in6addr_any;
     addr.sin6_port = htons(port);
-    if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
-        ::close(fd);
+    if (bindTo(fd, &addr, sizeof(addr)) != 0) {
+        sock::close(fd);
         return -1;
     }
     return fd;
@@ -156,7 +224,7 @@ void joinGroups(int fd4, int fd6, std::vector<uint32_t>& joined4, std::vector<un
             ip_mreq request{};
             inet_pton(AF_INET, GROUP_V4, &request.imr_multiaddr);
             request.imr_interface = iface.address;
-            if (setsockopt(fd4, IPPROTO_IP, IP_ADD_MEMBERSHIP, &request, sizeof(request)) == 0) {
+            if (sock::setOption(fd4, IPPROTO_IP, IP_ADD_MEMBERSHIP, &request, sizeof(request)) == 0) {
                 joined4.push_back(iface.address.s_addr);
             }
         }
@@ -167,7 +235,7 @@ void joinGroups(int fd4, int fd6, std::vector<uint32_t>& joined4, std::vector<un
             ipv6_mreq request{};
             inet_pton(AF_INET6, GROUP_V6, &request.ipv6mr_multiaddr);
             request.ipv6mr_interface = index;
-            if (setsockopt(fd6, IPPROTO_IPV6, IPV6_JOIN_GROUP, &request, sizeof(request)) == 0) {
+            if (sock::setOption(fd6, IPPROTO_IPV6, IPV6_JOIN_GROUP, &request, sizeof(request)) == 0) {
                 joined6.push_back(index);
             }
         }
@@ -180,8 +248,7 @@ struct SendTally {
     void note(ssize_t result) {
         ++attempts;
         // What a send gets when the OS has refused this process the network
-        if (result < 0 && (errno == EHOSTUNREACH || errno == EPERM || errno == EACCES ||
-                           errno == ENETUNREACH)) {
+        if (result < 0 && sock::networkRefused(sock::lastError())) {
             ++blocked;
         }
     }
@@ -196,24 +263,24 @@ void sendEverywhere(int fd4, int fd6, const std::vector<uint8_t>& datagram, uint
 
         for (const Interface& iface : ipv4Interfaces()) {
             if (iface.canMulticast) {
-                setsockopt(fd4, IPPROTO_IP, IP_MULTICAST_IF, &iface.address, sizeof(iface.address));
+                sock::setOption(fd4, IPPROTO_IP, IP_MULTICAST_IF, &iface.address, sizeof(iface.address));
                 inet_pton(AF_INET, GROUP_V4, &target.sin_addr);
-                tally.note(sendto(fd4, datagram.data(), datagram.size(), 0,
-                                  reinterpret_cast<sockaddr*>(&target), sizeof(target)));
+                tally.note(sock::sendTo(fd4, datagram.data(), datagram.size(),
+                                        reinterpret_cast<sockaddr*>(&target), sizeof(target)));
             }
             if (iface.canBroadcast) {
                 target.sin_addr = iface.broadcast;
-                tally.note(sendto(fd4, datagram.data(), datagram.size(), 0,
-                                  reinterpret_cast<sockaddr*>(&target), sizeof(target)));
+                tally.note(sock::sendTo(fd4, datagram.data(), datagram.size(),
+                                        reinterpret_cast<sockaddr*>(&target), sizeof(target)));
             }
         }
 
         target.sin_addr.s_addr = htonl(INADDR_BROADCAST);
-        sendto(fd4, datagram.data(), datagram.size(), 0, reinterpret_cast<sockaddr*>(&target), sizeof(target));
+        sock::sendTo(fd4, datagram.data(), datagram.size(), reinterpret_cast<sockaddr*>(&target), sizeof(target));
 
         // A server on this very machine, with no network at all
         target.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        sendto(fd4, datagram.data(), datagram.size(), 0, reinterpret_cast<sockaddr*>(&target), sizeof(target));
+        sock::sendTo(fd4, datagram.data(), datagram.size(), reinterpret_cast<sockaddr*>(&target), sizeof(target));
     }
 
     if (fd6 >= 0) {
@@ -222,9 +289,9 @@ void sendEverywhere(int fd4, int fd6, const std::vector<uint8_t>& datagram, uint
         target.sin6_port = htons(port);
         inet_pton(AF_INET6, GROUP_V6, &target.sin6_addr);
         for (unsigned index : ipv6Interfaces()) {
-            setsockopt(fd6, IPPROTO_IPV6, IPV6_MULTICAST_IF, &index, sizeof(index));
+            sock::setOption(fd6, IPPROTO_IPV6, IPV6_MULTICAST_IF, &index, sizeof(index));
             target.sin6_scope_id = index;
-            sendto(fd6, datagram.data(), datagram.size(), 0, reinterpret_cast<sockaddr*>(&target), sizeof(target));
+            sock::sendTo(fd6, datagram.data(), datagram.size(), reinterpret_cast<sockaddr*>(&target), sizeof(target));
         }
     }
 }
@@ -326,6 +393,7 @@ int addressRank(const std::string& text) {
 }  // namespace
 
 std::vector<std::string> localAddresses() {
+    sock::startup();
     std::vector<std::string> out;
     for (const Interface& iface : ipv4Interfaces()) {
         char text[INET_ADDRSTRLEN] = {0};
@@ -379,7 +447,7 @@ struct DiscoveryBeacon::Impl {
             copy = listing;
         }
         auto bytes = encodeDatagram(KIND_ANNOUNCE, app, instance, gamePort, copy);
-        sendto(fd, bytes.data(), bytes.size(), 0, reinterpret_cast<const sockaddr*>(&to), size);
+        sock::sendTo(fd, bytes.data(), bytes.size(), reinterpret_cast<const sockaddr*>(&to), size);
     }
 
     void drain(int fd) {
@@ -387,7 +455,7 @@ struct DiscoveryBeacon::Impl {
         for (;;) {
             sockaddr_storage from{};
             socklen_t size = sizeof(from);
-            ssize_t got = recvfrom(fd, buffer, sizeof(buffer), 0, reinterpret_cast<sockaddr*>(&from), &size);
+            ssize_t got = sock::recvFrom(fd, buffer, sizeof(buffer), reinterpret_cast<sockaddr*>(&from), &size);
             if (got <= 0) return;
             auto datagram = decodeDatagram(buffer, static_cast<size_t>(got));
             if (!datagram || datagram->kind != KIND_QUERY) continue;
@@ -415,8 +483,8 @@ struct DiscoveryBeacon::Impl {
                 nextAnnounce = now + ANNOUNCE_INTERVAL;
             }
 
-            pollfd fds[2] = {{fd4, POLLIN, 0}, {fd6, POLLIN, 0}};
-            poll(fds, 2, 100);
+            pollfd fds[2] = {sock::entry(fd4, POLLIN), sock::entry(fd6, POLLIN)};
+            sock::poll(fds, 2, 100);
             if (fds[0].revents & POLLIN) drain(fd4);
             if (fds[1].revents & POLLIN) drain(fd6);
         }
@@ -432,14 +500,15 @@ struct DiscoveryBeacon::Impl {
             stopping = true;
         }
         if (thread.joinable()) thread.join();
-        if (fd4 >= 0) ::close(fd4);
-        if (fd6 >= 0) ::close(fd6);
+        sock::close(fd4);
+        sock::close(fd6);
         fd4 = fd6 = -1;
     }
 };
 
 DiscoveryBeacon::DiscoveryBeacon(std::string app, uint16_t gamePort, uint16_t discoveryPort)
     : impl_(std::make_unique<Impl>()) {
+    sock::startup();
     impl_->app = std::move(app);
     impl_->gamePort = gamePort;
     impl_->discoveryPort = discoveryPort;
@@ -524,7 +593,7 @@ struct DiscoveryBrowser::Impl {
         if (getaddrinfo(host.c_str(), std::to_string(port).c_str(), &hints, &found) != 0) return;
         for (addrinfo* entry = found; entry; entry = entry->ai_next) {
             int fd = entry->ai_family == AF_INET6 ? reply6 : reply4;
-            if (fd >= 0) sendto(fd, bytes.data(), bytes.size(), 0, entry->ai_addr, entry->ai_addrlen);
+            if (fd >= 0) sock::sendTo(fd, bytes.data(), bytes.size(), entry->ai_addr, entry->ai_addrlen);
         }
         freeaddrinfo(found);
     }
@@ -555,7 +624,7 @@ struct DiscoveryBrowser::Impl {
         target.sin_port = htons(config.discoveryPort);
         for (int i = 0; i < SWEEP_BATCH && sweepHost < 254; ++i) {
             target.sin_addr.s_addr = htonl(base + ++sweepHost);
-            sendto(reply4, bytes.data(), bytes.size(), 0, reinterpret_cast<sockaddr*>(&target), sizeof(target));
+            sock::sendTo(reply4, bytes.data(), bytes.size(), reinterpret_cast<sockaddr*>(&target), sizeof(target));
         }
         if (sweepHost >= 254) {
             sweepHost = 0;
@@ -568,7 +637,7 @@ struct DiscoveryBrowser::Impl {
         for (;;) {
             sockaddr_storage from{};
             socklen_t size = sizeof(from);
-            ssize_t got = recvfrom(fd, buffer, sizeof(buffer), 0, reinterpret_cast<sockaddr*>(&from), &size);
+            ssize_t got = sock::recvFrom(fd, buffer, sizeof(buffer), reinterpret_cast<sockaddr*>(&from), &size);
             if (got <= 0) return;
             auto datagram = decodeDatagram(buffer, static_cast<size_t>(got));
             if (!datagram) continue;
@@ -647,8 +716,9 @@ struct DiscoveryBrowser::Impl {
             }
             if (empty && now - started >= config.sweepAfter) sweepSome();
 
-            pollfd fds[4] = {{fd4, POLLIN, 0}, {fd6, POLLIN, 0}, {reply4, POLLIN, 0}, {reply6, POLLIN, 0}};
-            poll(fds, 4, 50);
+            pollfd fds[4] = {sock::entry(fd4, POLLIN), sock::entry(fd6, POLLIN), sock::entry(reply4, POLLIN),
+                             sock::entry(reply6, POLLIN)};
+            sock::poll(fds, 4, 50);
             if (fds[0].revents & POLLIN) receive(fd4, false);
             if (fds[1].revents & POLLIN) receive(fd6, false);
             if (fds[2].revents & POLLIN) receive(reply4, true);
@@ -659,6 +729,7 @@ struct DiscoveryBrowser::Impl {
 };
 
 DiscoveryBrowser::DiscoveryBrowser(Config config) : impl_(std::make_unique<Impl>()) {
+    sock::startup();
     impl_->config = std::move(config);
     impl_->fd4 = openBoundV4(impl_->config.discoveryPort);
     impl_->fd6 = openBoundV6(impl_->config.discoveryPort);
@@ -675,7 +746,7 @@ DiscoveryBrowser::~DiscoveryBrowser() {
     }
     if (impl_->thread.joinable()) impl_->thread.join();
     for (int fd : {impl_->fd4, impl_->fd6, impl_->reply4, impl_->reply6}) {
-        if (fd >= 0) ::close(fd);
+        sock::close(fd);
     }
 }
 

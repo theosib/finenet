@@ -23,6 +23,7 @@ add_library(finenet
     src/stream_transport.cpp
     src/listener.cpp
     src/discovery.cpp
+    src/socket_compat.cpp
 )
 add_library(finenet::finenet ALIAS finenet)
 
@@ -35,6 +36,14 @@ target_compile_features(finenet PUBLIC cxx_std_20)
 
 find_package(Threads REQUIRED)
 target_link_libraries(finenet PUBLIC Threads::Threads)
+
+if(WIN32)
+    target_link_libraries(finenet PUBLIC ws2_32 iphlpapi)
+    target_compile_definitions(finenet PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0A00)
+endif()
+if(MSVC)
+    target_compile_options(finenet PUBLIC /utf-8 /permissive- /Zc:__cplusplus)
+endif()
 
 # ── Tests ────────────────────────────────────────────────────────────────────
 
@@ -64,6 +73,13 @@ if(FINENET_BUILD_TESTS)
     )
 
     target_link_libraries(finenet_tests PRIVATE finenet GTest::gtest GTest::gtest_main)
+    # The tests drive raw sockets through the same portability layer
+    target_include_directories(finenet_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    if(WIN32)
+        target_compile_definitions(finenet_tests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0A00)
+        # Keep gtest on the same runtime as the code under test
+        set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+    endif()
     target_compile_features(finenet_tests PRIVATE cxx_std_20)
 
     include(GoogleTest)

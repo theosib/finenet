@@ -1,23 +1,16 @@
 #include "finenet/listener.hpp"
 
 #include "finenet/wake_signal.hpp"
+#include "socket_compat.hpp"
 #include "stream_transport.hpp"
 
 #include <atomic>
-#include <cerrno>
 #include <chrono>
 #include <cstring>
 #include <deque>
 #include <mutex>
 #include <thread>
 #include <vector>
-
-#include <arpa/inet.h>
-#include <fcntl.h>
-#include <netinet/in.h>
-#include <poll.h>
-#include <sys/socket.h>
-#include <unistd.h>
 
 namespace finenet {
 
@@ -47,18 +40,18 @@ struct Listener::Impl {
     void stop() {
         stopping = true;
         if (thread.joinable()) thread.join();
-        for (int fd : sockets) ::close(fd);
+        for (int fd : sockets) sock::close(fd);
         sockets.clear();
     }
 
     void run() {
         while (!stopping) {
             std::vector<pollfd> fds;
-            for (int fd : sockets) fds.push_back({fd, POLLIN, 0});
-            poll(fds.data(), static_cast<nfds_t>(fds.size()), 50);
+            for (int fd : sockets) fds.push_back(sock::entry(fd, POLLIN));
+            sock::poll(fds.data(), fds.size(), 50);
 
-            for (const pollfd& entry : fds) {
-                if (entry.revents & POLLIN) acceptFrom(entry.fd);
+            for (size_t i = 0; i < fds.size(); ++i) {
+                if (fds[i].revents & POLLIN) acceptFrom(sockets[i]);
             }
             checkHandshakes();
         }
@@ -67,12 +60,12 @@ struct Listener::Impl {
     void acceptFrom(int listenFd) {
         sockaddr_storage peer{};
         socklen_t size = sizeof(peer);
-        int fd = ::accept(listenFd, reinterpret_cast<sockaddr*>(&peer), &size);
+        int fd = sock::accept(listenFd, reinterpret_cast<sockaddr*>(&peer), &size);
         if (fd < 0) return;
         detail::prepareSocket(fd);
 
         if (handshaking.size() >= config.maxHandshaking) {
-            ::close(fd);
+            sock::close(fd);
             return;
         }
 
@@ -113,64 +106,87 @@ Listener::Listener(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
 Listener::~Listener() = default;
 
 std::unique_ptr<Listener> Listener::listen(uint16_t port, const ListenerConfig& config, std::string* error) {
+    sock::startup();
     auto impl = std::make_unique<Impl>();
     impl->config = config;
 
-    auto fail = [&](const std::string& what) {
-        if (error) *error = what + ": " + std::strerror(errno);
+    auto fail = [&](const std::string& what, int code) {
+        if (error) *error = what + ": " + sock::errorText(code);
         return nullptr;
     };
+#ifdef _WIN32
+    // SO_REUSEADDR on Windows lets a second server take a port that's in use, and a listening
+    // port there is never held by TIME_WAIT anyway. This is what keeps it to one.
+    auto reuse = [](int fd) {
+        int on = 1;
+        sock::setOption(fd, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, &on, sizeof(on));
+    };
+    auto bindTo = [](int fd, const void* addr, size_t size) {
+        return ::bind(static_cast<SOCKET>(fd), static_cast<const sockaddr*>(addr), static_cast<int>(size));
+    };
+#else
+    auto reuse = [](int fd) {
+        int on = 1;
+        sock::setOption(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+    };
+    auto bindTo = [](int fd, const void* addr, size_t size) {
+        return ::bind(fd, static_cast<const sockaddr*>(addr), static_cast<socklen_t>(size));
+    };
+#endif
 
     // One dual-stack socket takes IPv4 too. Where IPv6 is off, that's what's left.
-    int fd = ::socket(AF_INET6, SOCK_STREAM, 0);
+    int fd = sock::open(AF_INET6, SOCK_STREAM, 0);
     if (fd >= 0) {
         detail::prepareSocket(fd);
-        int on = 1, off = 0;
-        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
-        setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &off, sizeof(off));
+        int off = 0;
+        reuse(fd);
+        sock::setOption(fd, IPPROTO_IPV6, IPV6_V6ONLY, &off, sizeof(off));
         sockaddr_in6 addr{};
         addr.sin6_family = AF_INET6;
         addr.sin6_addr = in6addr_any;
         addr.sin6_port = htons(port);
-        if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
-            int saved = errno;
-            ::close(fd);
+        if (bindTo(fd, &addr, sizeof(addr)) != 0) {
+            int saved = sock::lastError();
+            sock::close(fd);
             fd = -1;
-            if (saved == EADDRINUSE) {
-                errno = saved;
-                return fail("port " + std::to_string(port) + " is in use");
-            }
+            if (sock::addressInUse(saved)) return fail("port " + std::to_string(port) + " is in use", saved);
         }
     }
     if (fd < 0) {
-        fd = ::socket(AF_INET, SOCK_STREAM, 0);
-        if (fd < 0) return fail("couldn't make a socket");
+        fd = sock::open(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0) return fail("couldn't make a socket", sock::lastError());
         detail::prepareSocket(fd);
-        int on = 1;
-        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+        reuse(fd);
         sockaddr_in addr{};
         addr.sin_family = AF_INET;
         addr.sin_addr.s_addr = htonl(INADDR_ANY);
         addr.sin_port = htons(port);
-        if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
-            std::string what = "couldn't bind port " + std::to_string(port);
-            auto result = fail(what);
-            ::close(fd);
+        if (bindTo(fd, &addr, sizeof(addr)) != 0) {
+            auto result = fail("couldn't bind port " + std::to_string(port), sock::lastError());
+            sock::close(fd);
             return result;
         }
     }
 
-    if (::listen(fd, 16) != 0) {
-        auto result = fail("couldn't listen");
-        ::close(fd);
+#ifdef _WIN32
+    int listened = ::listen(static_cast<SOCKET>(fd), 16);
+#else
+    int listened = ::listen(fd, 16);
+#endif
+    if (listened != 0) {
+        auto result = fail("couldn't listen", sock::lastError());
+        sock::close(fd);
         return result;
     }
-    int flags = fcntl(fd, F_GETFL, 0);
-    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    sock::setNonBlocking(fd);
 
     sockaddr_storage bound{};
     socklen_t size = sizeof(bound);
+#ifdef _WIN32
+    getsockname(static_cast<SOCKET>(fd), reinterpret_cast<sockaddr*>(&bound), &size);
+#else
     getsockname(fd, reinterpret_cast<sockaddr*>(&bound), &size);
+#endif
     impl->port = ntohs(bound.ss_family == AF_INET6 ? reinterpret_cast<sockaddr_in6*>(&bound)->sin6_port
                                                    : reinterpret_cast<sockaddr_in*>(&bound)->sin_port);
     impl->sockets.push_back(fd);

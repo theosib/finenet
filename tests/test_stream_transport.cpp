@@ -5,10 +5,7 @@
 #include "finenet/message_reader.hpp"
 #include "finenet/wake_signal.hpp"
 
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <unistd.h>
+#include "socket_compat.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -216,20 +213,20 @@ TEST(StreamTransportTest, ASilentPeerTimesOut) {
     ASSERT_NE(listener, nullptr);
 
     // A raw socket that does its half of the handshake, stays open, and never says another word
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    int fd = sock::open(AF_INET, SOCK_STREAM, 0);
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     addr.sin_port = htons(listener->port());
-    ASSERT_EQ(connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
+    ASSERT_EQ(sock::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
     constexpr uint8_t preamble[8] = {'F', 'N', 'E', 'T', 1, 0, 0, 0};
-    ASSERT_EQ(write(fd, preamble, 8), 8);
+    ASSERT_EQ(sock::send(fd, preamble, 8, 0), 8);
 
     std::unique_ptr<Connection> server;
     ASSERT_TRUE(waitFor([&] { return (server = listener->accept()) != nullptr; }));
     EXPECT_TRUE(waitFor([&] { return !server->isConnected(); }, 2000ms));
     EXPECT_EQ(server->disconnectReason(), "timed out");
-    close(fd);
+    sock::close(fd);
 }
 
 TEST(StreamTransportTest, KeepAliveHoldsAQuietConnectionOpenAndMeasuresRtt) {
@@ -248,37 +245,37 @@ TEST(StreamTransportTest, AStrangerSpeakingAnotherProtocolIsDropped) {
     auto listener = Listener::listen(0);
     ASSERT_NE(listener, nullptr);
 
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    int fd = sock::open(AF_INET, SOCK_STREAM, 0);
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     addr.sin_port = htons(listener->port());
-    ASSERT_EQ(connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
+    ASSERT_EQ(sock::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
     const char* request = "GET / HTTP/1.1\r\n\r\n";
-    ASSERT_GT(write(fd, request, strlen(request)), 0);
+    ASSERT_GT(sock::send(fd, request, strlen(request), 0), 0);
 
     std::this_thread::sleep_for(300ms);
     EXPECT_EQ(listener->accept(), nullptr);
-    close(fd);
+    sock::close(fd);
 }
 
 TEST(StreamTransportTest, AFrameTooLongIsRefused) {
     auto listener = Listener::listen(0);
     ASSERT_NE(listener, nullptr);
 
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    int fd = sock::open(AF_INET, SOCK_STREAM, 0);
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     addr.sin_port = htons(listener->port());
-    ASSERT_EQ(connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
+    ASSERT_EQ(sock::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
     constexpr uint8_t hello[] = {'F', 'N', 'E', 'T', 1, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0x7F, 1, 0};
-    ASSERT_EQ(write(fd, hello, sizeof(hello)), static_cast<ssize_t>(sizeof(hello)));
+    ASSERT_EQ(sock::send(fd, hello, sizeof(hello), 0), static_cast<ssize_t>(sizeof(hello)));
 
     // It arrives with the preamble, so this connection never gets as far as being accepted
     std::this_thread::sleep_for(300ms);
     EXPECT_EQ(listener->accept(), nullptr);
-    close(fd);
+    sock::close(fd);
 }
 
 TEST(StreamTransportTest, AMessagePastTheLimitIsRefused) {

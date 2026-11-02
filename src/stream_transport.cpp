@@ -1,23 +1,10 @@
 #include "stream_transport.hpp"
 
+#include "socket_compat.hpp"
+
 #include <algorithm>
-#include <cerrno>
 #include <chrono>
 #include <cstring>
-
-#include <arpa/inet.h>
-#include <fcntl.h>
-#include <netdb.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <poll.h>
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <unistd.h>
-
-#ifndef MSG_NOSIGNAL
-#define MSG_NOSIGNAL 0  // macOS uses SO_NOSIGPIPE, in prepareSocket
-#endif
 
 namespace finenet::detail {
 
@@ -35,11 +22,6 @@ constexpr auto LINGER_LIMIT = std::chrono::seconds(1);
 constexpr int DIAL_MS_PER_ADDRESS = 3000;
 /// How much may sit unsent in the kernel. Past this, a late urgent message would queue behind it.
 constexpr int KERNEL_UNSENT_BYTES = 32 * 1024;
-
-void setNonBlocking(int fd) {
-    int flags = fcntl(fd, F_GETFL, 0);
-    if (flags >= 0) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-}
 
 std::string describeAddress(const sockaddr* addr) {
     char text[INET6_ADDRSTRLEN] = {0};
@@ -59,7 +41,12 @@ uint64_t monotonicMicros() {
 }  // namespace
 
 void prepareSocket(int fd) {
+#ifdef _WIN32
+    // Not to be handed to a process this one starts, which would hold its port
+    SetHandleInformation(reinterpret_cast<HANDLE>(static_cast<uintptr_t>(fd)), HANDLE_FLAG_INHERIT, 0);
+#else
     fcntl(fd, F_SETFD, FD_CLOEXEC);
+#endif
 #ifdef SO_NOSIGPIPE
     int on = 1;
     setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof(on));
@@ -68,21 +55,16 @@ void prepareSocket(int fd) {
 
 StreamTransport::StreamTransport(const ConnectionConfig& config, Handlers handlers)
     : config_(config), handlers_(std::move(handlers)) {
-    int fds[2];
-    if (pipe(fds) == 0) {
-        wakeRead_ = fds[0];
-        wakeWrite_ = fds[1];
-        setNonBlocking(wakeRead_);
-        setNonBlocking(wakeWrite_);
-    }
+    sock::startup();
+    sock::makeWakePair(wakeRead_, wakeWrite_);
     inbound_.resize(READ_BYTES * 2);
 }
 
 StreamTransport::~StreamTransport() {
     close("", false);
-    if (socket_ >= 0) ::close(socket_);
-    if (wakeRead_ >= 0) ::close(wakeRead_);
-    if (wakeWrite_ >= 0) ::close(wakeWrite_);
+    sock::close(socket_);
+    sock::close(wakeRead_);
+    sock::close(wakeWrite_);
 }
 
 void StreamTransport::startConnect(std::string host, uint16_t port) {
@@ -98,9 +80,7 @@ void StreamTransport::startAccepted(int fd, std::string peerAddress) {
 }
 
 void StreamTransport::wake() {
-    uint8_t byte = 1;
-    // A full pipe means it's already going to wake
-    [[maybe_unused]] auto written = ::write(wakeWrite_, &byte, 1);
+    sock::wakeSend(wakeWrite_);
 }
 
 SendResult StreamTransport::send(const Message& message, const ChannelConfig& channel, Priority priority) {
@@ -193,15 +173,20 @@ bool StreamTransport::dial() {
 
     failure_ = "couldn't connect to " + host_;
     for (addrinfo* entry = found; entry; entry = entry->ai_next) {
-        int fd = ::socket(entry->ai_family, entry->ai_socktype, entry->ai_protocol);
+        int fd = sock::open(entry->ai_family, entry->ai_socktype, entry->ai_protocol);
         if (fd < 0) continue;
         prepareSocket(fd);
-        setNonBlocking(fd);
+        sock::setNonBlocking(fd);
 
+#ifdef _WIN32
+        int result = ::connect(static_cast<SOCKET>(fd), entry->ai_addr, static_cast<int>(entry->ai_addrlen));
+#else
         int result = ::connect(fd, entry->ai_addr, entry->ai_addrlen);
-        if (result != 0 && errno != EINPROGRESS) {
-            failure_ = "couldn't connect to " + host_ + ": " + std::strerror(errno);
-            ::close(fd);
+#endif
+        int connectError = result != 0 ? sock::lastError() : 0;
+        if (result != 0 && !sock::connectPending(connectError)) {
+            failure_ = "couldn't connect to " + host_ + ": " + sock::errorText(connectError);
+            sock::close(fd);
             continue;
         }
         if (result != 0) {
@@ -209,27 +194,24 @@ bool StreamTransport::dial() {
             bool ready = false;
             auto deadline = Clock::now() + std::chrono::milliseconds(DIAL_MS_PER_ADDRESS);
             while (Clock::now() < deadline) {
-                pollfd fds[2] = {{fd, POLLOUT, 0}, {wakeRead_, POLLIN, 0}};
-                poll(fds, 2, 100);
+                pollfd fds[2] = {sock::entry(fd, POLLOUT), sock::entry(wakeRead_, POLLIN)};
+                sock::poll(fds, 2, 100);
                 if (fds[0].revents != 0) {
                     ready = true;
                     break;
                 }
-                if (fds[1].revents != 0) {
-                    uint8_t drain[32];
-                    while (::read(wakeRead_, drain, sizeof(drain)) > 0) {}
-                }
+                if (fds[1].revents != 0) sock::wakeDrain(wakeRead_);
                 std::lock_guard lock(mutex_);
                 if (closing_) break;
             }
-            int error = ETIMEDOUT;
+            int error = sock::timedOut();
             if (ready) {
                 socklen_t size = sizeof(error);
-                getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &size);
+                sock::getOption(fd, SOL_SOCKET, SO_ERROR, &error, &size);
             }
             if (!ready || error != 0) {
-                failure_ = "couldn't connect to " + host_ + ": " + std::strerror(error);
-                ::close(fd);
+                failure_ = "couldn't connect to " + host_ + ": " + sock::errorText(error);
+                sock::close(fd);
                 std::lock_guard lock(mutex_);
                 if (closing_) break;
                 continue;
@@ -247,12 +229,14 @@ bool StreamTransport::dial() {
 }
 
 void StreamTransport::loop() {
-    setNonBlocking(socket_);
+    sock::setNonBlocking(socket_);
     int on = 1;
-    setsockopt(socket_, IPPROTO_TCP, TCP_NODELAY, &on, sizeof(on));
+    sock::setOption(socket_, IPPROTO_TCP, TCP_NODELAY, &on, sizeof(on));
 #ifdef TCP_NOTSENT_LOWAT
     int unsent = KERNEL_UNSENT_BYTES;
-    setsockopt(socket_, IPPROTO_TCP, TCP_NOTSENT_LOWAT, &unsent, sizeof(unsent));
+    sock::setOption(socket_, IPPROTO_TCP, TCP_NOTSENT_LOWAT, &unsent, sizeof(unsent));
+#else
+    (void)KERNEL_UNSENT_BYTES;
 #endif
 
     lastReceived_ = lastSent_ = Clock::now();
@@ -295,17 +279,17 @@ void StreamTransport::loop() {
         }
         if (closing && Clock::now() >= closeDeadline_) break;
 
-        pollfd fds[2] = {{socket_, static_cast<short>(POLLIN | (hasOutput ? POLLOUT : 0)), 0},
-                         {wakeRead_, POLLIN, 0}};
-        int ready = poll(fds, 2, 100);
-        if (ready < 0 && errno != EINTR) {
-            failure_ = std::string("poll failed: ") + std::strerror(errno);
-            break;
+        pollfd fds[2] = {sock::entry(socket_, static_cast<short>(POLLIN | (hasOutput ? POLLOUT : 0))),
+                         sock::entry(wakeRead_, POLLIN)};
+        int ready = sock::poll(fds, 2, 100);
+        if (ready < 0) {
+            int error = sock::lastError();
+            if (!sock::wouldBlock(error)) {
+                failure_ = "poll failed: " + sock::errorText(error);
+                break;
+            }
         }
-        if (fds[1].revents != 0) {
-            uint8_t drain[64];
-            while (::read(wakeRead_, drain, sizeof(drain)) > 0) {}
-        }
+        if (fds[1].revents != 0) sock::wakeDrain(wakeRead_);
         if (fds[0].revents & (POLLIN | POLLHUP | POLLERR)) pumpRead();
         if (failure_.empty() && (fds[0].revents & POLLOUT)) pumpWrite();
 
@@ -393,11 +377,12 @@ bool StreamTransport::nextFrame() {
 void StreamTransport::pumpWrite() {
     // Until the kernel says stop, or there's nothing left
     while (frameSent_ < frameOut_.size() || nextFrame()) {
-        ssize_t sent = ::send(socket_, frameOut_.data() + frameSent_, frameOut_.size() - frameSent_,
-                              MSG_NOSIGNAL);
+        ssize_t sent = sock::send(socket_, frameOut_.data() + frameSent_, frameOut_.size() - frameSent_,
+                                  MSG_NOSIGNAL);
         if (sent < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) return;
-            failure_ = std::string("connection lost: ") + std::strerror(errno);
+            int error = sock::lastError();
+            if (sock::wouldBlock(error)) return;
+            failure_ = "connection lost: " + sock::errorText(error);
             return;
         }
         frameSent_ += static_cast<size_t>(sent);
@@ -408,15 +393,16 @@ void StreamTransport::pumpWrite() {
 void StreamTransport::pumpRead() {
     while (failure_.empty()) {
         if (inbound_.size() - inboundUsed_ < READ_BYTES) inbound_.resize(inboundUsed_ + READ_BYTES);
-        ssize_t got = ::recv(socket_, inbound_.data() + inboundUsed_, READ_BYTES, 0);
+        ssize_t got = sock::recv(socket_, inbound_.data() + inboundUsed_, READ_BYTES, 0);
         if (got == 0) {
             std::lock_guard lock(mutex_);
             failure_ = closeReason_.empty() ? "connection closed" : closeReason_;
             return;
         }
         if (got < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) return;
-            failure_ = std::string("connection lost: ") + std::strerror(errno);
+            int error = sock::lastError();
+            if (sock::wouldBlock(error)) return;
+            failure_ = "connection lost: " + sock::errorText(error);
             return;
         }
         inboundUsed_ += static_cast<size_t>(got);
@@ -524,7 +510,11 @@ void StreamTransport::handleTransport(const uint8_t* data, size_t size) {
 
 void StreamTransport::finish(std::string reason) {
     if (socket_ >= 0) {
+#ifdef _WIN32
+        ::shutdown(static_cast<SOCKET>(socket_), SHUT_RDWR);
+#else
         ::shutdown(socket_, SHUT_RDWR);
+#endif
     }
     if (handlers_.closed) handlers_.closed(std::move(reason));
 }

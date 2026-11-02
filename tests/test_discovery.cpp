@@ -1,10 +1,7 @@
 #include <gtest/gtest.h>
 #include "finenet/discovery.hpp"
 
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <unistd.h>
+#include "socket_compat.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -48,13 +45,13 @@ DiscoveryBrowser::Config config(const std::string& app, uint16_t port) {
 
 /// Send raw bytes to the discovery port, as a peer with no manners might
 void sendRaw(const std::vector<uint8_t>& datagram, uint16_t port) {
-    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    int fd = sock::open(AF_INET, SOCK_DGRAM, 0);
     sockaddr_in target{};
     target.sin_family = AF_INET;
     target.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     target.sin_port = htons(port);
-    sendto(fd, datagram.data(), datagram.size(), 0, reinterpret_cast<sockaddr*>(&target), sizeof(target));
-    close(fd);
+    sock::sendTo(fd, datagram.data(), datagram.size(), reinterpret_cast<sockaddr*>(&target), sizeof(target));
+    sock::close(fd);
 }
 
 /// An Announce from a server that will never be heard from again, and won't say goodbye
