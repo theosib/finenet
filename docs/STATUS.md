@@ -20,14 +20,11 @@ isn't built. The wire format in use is specified in FineStructureVoxel's
 
 These passed nothing because nothing has tried them.
 
-- **Two machines.** Every run so far has been on one Mac. Discovery was heard on the real interface,
-  but from itself. A second machine on a real LAN is the test that matters most: see Keystone's
-  `docs/PLATFORMS.md` for the steps, and put the result here.
 - **The /24 sweep.** `DiscoveryBrowser`'s `sweepSome` has never run in a test: `test_discovery.cpp`
   sets `sweep = false`, and on a working network the browser finds something before it starts.
 - **`blocked()`.** macOS denying Local Network access has never happened here, so the `EHOSTUNREACH`
   path is untested. The test only checks that it stays false.
-- **Linux and Windows.** Only macOS has ever built this.
+- **Windows.** Only macOS and Linux have built this.
 
 ## Problems
 
@@ -35,11 +32,12 @@ These passed nothing because nothing has tried them.
   files won't build on Windows. It needs Winsock start-up, `closesocket`, `WSAPoll`, `ioctlsocket` in
   place of `fcntl`, something other than `pipe()` to wake the I/O thread (a loopback socket pair),
   and `GetAdaptersAddresses` in place of `getifaddrs`.
-- **`SO_REUSEPORT` may differ on Linux.** Several processes share the discovery port. On Linux a
-  unicast datagram to a shared port goes to just one socket, chosen by hash, which may be a browser's
-  and not a beacon's. That could lose direct probes, and loopback queries with two servers on one
-  machine. Group sends reach everyone. `FindsEveryServerOnOneMachine` and
-  `ADirectProbeFindsAServer` are the tests to watch.
+- **`SO_REUSEPORT` on Linux hasn't shown up, but could.** Several processes share the discovery port,
+  and a unicast datagram to a shared port goes to just one socket, chosen by hash, which may be a
+  browser's and not a beacon's. That could lose direct probes, and loopback queries with two servers
+  on one machine. Group sends reach everyone. `FindsEveryServerOnOneMachine` and
+  `ADirectProbeFindsAServer` passed 25 runs of 25 on Linux, and a Mac and a Linux box found each other
+  both ways, so if it happens it's rare. Those are still the tests to watch.
 - **No UDP.** `Connection::connect` is always TCP, so packet loss on the internet stalls every
   channel for a moment. `ConnectionConfig::transport`, `preferUdp`, `mtu`, `maxRetransmissions` and
   `coalescingWindowMs` do nothing yet, and nor does a channel's `Reliability` on the wire.
